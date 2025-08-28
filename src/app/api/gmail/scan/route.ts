@@ -3,6 +3,18 @@ import { google } from "googleapis";
 import { prisma } from "@/lib/prisma";
 import { createOAuthClient } from "@/lib/gmail";
 import { getSession } from "@/lib/auth";
+import { extractPolicy } from "@/lib/extraction";
+import fs from "fs";
+import path from "path";
+
+// Local copy of the shape we actually use so we don't depend on deep googleapis types
+interface MessagePart {
+  mimeType?: string | null;
+  filename?: string | null;
+  body?: { data?: string | null; attachmentId?: string | null } | null;
+  parts?: MessagePart[] | null;
+  headers?: Array<{ name?: string | null; value?: string | null }> | null;
+}
 
 export async function POST() {
   const session = await getSession();
@@ -30,42 +42,128 @@ export async function POST() {
         }
       });
     }
-    
     const gmail = google.gmail({ version: "v1", auth: oauth2Client });
 
-    // Query for insurance-related emails from the past 2 years
-    const q = 'subject:(policy OR renewal OR insurance OR coverage OR premium OR claim) newer_than:2y';
-    const res = await gmail.users.messages.list({ userId: 'me', q, maxResults: 25 });
+    // insurance-related query last 2y
+    const q =
+      "subject:(policy OR renewal OR insurance OR coverage OR premium) newer_than:2y";
+    const res = await gmail.users.messages.list({
+      userId: "me",
+      q,
+      maxResults: 50,
+    });
     const messages = res.data.messages || [];
-    
-    // Get basic metadata for the first 5 messages to help with debugging/development
-    const sampleMessages = [];
-    if (messages.length > 0) {
-      for (let i = 0; i < Math.min(5, messages.length); i++) {
-        try {
-          const message = await gmail.users.messages.get({
-            userId: 'me',
-            id: messages[i].id!,
-            format: 'metadata',
-            metadataHeaders: ['From', 'Subject', 'Date']
-          });
-          
-          const headers = message.data.payload?.headers || [];
-          const subject = headers.find(h => h.name === 'Subject')?.value || '';
-          const from = headers.find(h => h.name === 'From')?.value || '';
-          
-          sampleMessages.push({ id: messages[i].id, subject, from });
-        } catch (error) {
-          console.error('Error fetching message details:', error);
+
+    const uploadsDir = path.join(process.cwd(), "uploads");
+    if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir);
+
+    let processed = 0,
+      created = 0,
+      updated = 0;
+
+    for (const msg of messages) {
+      if (!msg.id) continue;
+      processed++;
+
+      const full = await gmail.users.messages.get({
+        userId: "me",
+        id: msg.id,
+        format: "full",
+      });
+
+      // pull headers
+      const headers =
+        Object.fromEntries(
+          (full.data.payload?.headers || []).map((h) => [h.name!, h.value || ""])
+        ) as Record<string, string>;
+      const from = headers["From"];
+
+      // gather text & save pdfs
+      let text = "";
+      const payload = full.data.payload as MessagePart | undefined;
+      const stack: MessagePart[] = payload ? [payload] : [];
+      while (stack.length) {
+        const part = stack.pop();
+        if (!part) continue;
+        if (part.parts) stack.push(...part.parts);
+        if (part.mimeType === "text/plain" && part.body?.data) {
+          text +=
+            "\n" + Buffer.from(part.body.data, "base64").toString("utf8");
         }
+        if (part.filename && part.body?.attachmentId) {
+          try {
+            const att = await gmail.users.messages.attachments.get({
+              userId: "me",
+              messageId: msg.id,
+              id: part.body.attachmentId,
+            });
+            if (att.data.data) {
+              const dataBuf = Buffer.from(att.data.data, "base64");
+              const safe = `${msg.id}-${part.filename}`.replace(
+                /[^a-zA-Z0-9._-]/g,
+                "_"
+              );
+              await fs.promises.writeFile(path.join(uploadsDir, safe), dataBuf);
+            }
+          } catch {
+            /* ignore attachment failures */
+          }
+        }
+      }
+
+      const extracted = extractPolicy(from, text);
+      if (!extracted.provider) continue;
+
+      const existing = await prisma.policy.findFirst({
+        where: {
+          userId: session.user.id,
+          provider: extracted.provider,
+          ...(extracted.policyNumber
+            ? { policyNumber: extracted.policyNumber }
+            : extracted.endDate
+            ? { endDate: extracted.endDate }
+            : {}),
+        },
+      });
+
+      if (existing) {
+        await prisma.policy.update({
+          where: { id: existing.id },
+          data: {
+            type: extracted.type || existing.type,
+            premiumPence:
+              extracted.premiumPence ?? existing.premiumPence,
+            startDate: extracted.startDate ?? existing.startDate,
+            endDate: extracted.endDate ?? existing.endDate,
+            autoRenew:
+              typeof extracted.autoRenew === "boolean"
+                ? extracted.autoRenew
+                : existing.autoRenew,
+          },
+        });
+        updated++;
+      } else if (extracted.policyNumber || extracted.endDate) {
+        await prisma.policy.create({
+          data: {
+            userId: session.user.id,
+            provider: extracted.provider,
+            policyNumber: extracted.policyNumber,
+            type: extracted.type || "OTHER",
+            premiumPence: extracted.premiumPence,
+            startDate: extracted.startDate,
+            endDate: extracted.endDate,
+            autoRenew: !!extracted.autoRenew,
+          },
+        });
+        created++;
       }
     }
 
-    return NextResponse.json({ 
-      searched: true, 
-      count: messages.length,
-      sampleMessages,
-      query: q
+    return NextResponse.json({
+      searched: true,
+      processed,
+      created,
+      updated,
     });
   } catch (error) {
     console.error('Gmail scan error:', error);
