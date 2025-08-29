@@ -1,6 +1,7 @@
 {
   "name": "conciergo",
   "version": "0.1.0",
+  "description": "Conciergo – insurance concierge MVP with Gmail extraction and reminders",
   "private": true,
   "scripts": {
     "dev": "next dev --turbopack",
