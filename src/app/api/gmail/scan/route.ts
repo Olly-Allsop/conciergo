@@ -6,6 +6,7 @@ import { getSession } from "@/lib/auth";
 import { extractPolicy } from "@/lib/extraction";
 import fs from "fs";
 import path from "path";
+import pdfParse from "pdf-parse";
 
 // Local copy of the shape we actually use so we don't depend on deep googleapis types
 interface MessagePart {
@@ -71,6 +72,10 @@ export async function POST() {
         format: "full",
       });
 
+      // collect attachment info to link later
+      const saved: { filePath: string; fileName: string; contentType?: string }[] =
+        [];
+
       // pull headers
       const headers =
         Object.fromEntries(
@@ -98,12 +103,33 @@ export async function POST() {
               id: part.body.attachmentId,
             });
             if (att.data.data) {
-              const dataBuf = Buffer.from(att.data.data, "base64");
+              const dataBuf = Buffer.from(
+                att.data.data.replace(/-/g, "+").replace(/_/g, "/"),
+                "base64"
+              );
               const safe = `${msg.id}-${part.filename}`.replace(
                 /[^a-zA-Z0-9._-]/g,
                 "_"
               );
-              await fs.promises.writeFile(path.join(uploadsDir, safe), dataBuf);
+              const fullPath = path.join(uploadsDir, safe);
+              await fs.promises.writeFile(fullPath, dataBuf);
+
+              // If PDF, extract text
+              if (part.filename.toLowerCase().endsWith(".pdf")) {
+                try {
+                  const parsed = await pdfParse(dataBuf);
+                  if (parsed.text) text += "\n" + parsed.text;
+                } catch {
+                  /* ignore pdf parse failures */
+                }
+              }
+
+              // Keep for Document linking
+              saved.push({
+                filePath: fullPath,
+                fileName: part.filename,
+                contentType: part.mimeType ?? undefined,
+              });
             }
           } catch {
             /* ignore attachment failures */
@@ -133,6 +159,8 @@ export async function POST() {
             type: extracted.type || existing.type,
             premiumPence:
               extracted.premiumPence ?? existing.premiumPence,
+            paymentFrequency:
+              extracted.paymentFrequency ?? existing.paymentFrequency,
             startDate: extracted.startDate ?? existing.startDate,
             endDate: extracted.endDate ?? existing.endDate,
             autoRenew:
@@ -143,19 +171,46 @@ export async function POST() {
         });
         updated++;
       } else if (extracted.policyNumber || extracted.endDate) {
-        await prisma.policy.create({
+        const newPolicy = await prisma.policy.create({
           data: {
             userId: session.user.id,
             provider: extracted.provider,
             policyNumber: extracted.policyNumber,
             type: extracted.type || "OTHER",
             premiumPence: extracted.premiumPence,
+            paymentFrequency: extracted.paymentFrequency,
             startDate: extracted.startDate,
             endDate: extracted.endDate,
             autoRenew: !!extracted.autoRenew,
           },
         });
         created++;
+
+        // Link documents to newly created policy
+        for (const file of saved) {
+          await prisma.document.create({
+            data: {
+              policyId: newPolicy.id,
+              fileName: file.fileName,
+              filePath: file.filePath,
+              contentType: file.contentType,
+            },
+          });
+        }
+      }
+
+      // Link documents to updated policy
+      if (existing && saved.length) {
+        for (const file of saved) {
+          await prisma.document.create({
+            data: {
+              policyId: existing.id,
+              fileName: file.fileName,
+              filePath: file.filePath,
+              contentType: file.contentType,
+            },
+          });
+        }
       }
     }
 

@@ -7,7 +7,29 @@ export type ExtractedPolicy = {
   startDate?: Date | null;
   endDate?: Date | null;
   premiumPence?: number | null;
+  paymentFrequency?: "monthly" | "yearly" | null;
   autoRenew?: boolean;
+};
+
+// Map common sender-domains to nicely formatted provider names
+const providerMap: Record<string, string> = {
+  aviva: "Aviva",
+  admiral: "Admiral",
+  directline: "Direct Line",
+  churchill: "Churchill",
+  "hastingsdirect": "Hastings Direct",
+  axa: "AXA",
+  allianz: "Allianz",
+  zurich: "Zurich",
+  saga: "Saga",
+  lv: "LV",
+  lvgigroup: "LV",
+  tescobank: "Tesco Bank",
+  tesco: "Tesco Bank",
+  comparethemarket: "Compare the Market",
+  gocompare: "GoCompare",
+  confused: "Confused.com",
+  moneysupermarket: "MoneySuperMarket",
 };
 
 function titleCase(word: string) {
@@ -22,12 +44,12 @@ export function providerFromFromHeader(from: string | undefined): string | undef
   const domain = m[1];
   const label = domain.split(".")[0];
   if (!label) return undefined;
-  return titleCase(label);
+  return providerMap[label.toLowerCase()] || titleCase(label);
 }
 
 export function detectPolicyType(text: string): PolicyType | undefined {
   const t = text.toLowerCase();
-  if (/\b(car|motor|auto)\b/.test(t)) return "CAR";
+  if (/\b(car|motor|auto|van|multi[-\s]?car)\b/.test(t)) return "CAR";
   if (/(home|buildings?|contents?)/.test(t)) return "HOME";
   if (/\blife\b/.test(t)) return "LIFE";
   if (/\bpet\b/.test(t)) return "PET";
@@ -70,14 +92,23 @@ export function extractDates(text: string): { start?: Date; end?: Date } {
   return out;
 }
 
-export function extractPremium(text: string): number | undefined {
-  // Look for £ followed by number, optionally per year/month
-  const re = /£\s*([0-9,.]+)\s*(per\s*(year|annum|month)|\/(year|annum|month))?/i;
+export function extractPremiumAndFrequency(
+  text: string,
+): { pence?: number; frequency?: "monthly" | "yearly" } {
+  // £123.45 per month /year or yearly/monthly keywords
+  const re =
+    /£\s*([0-9,.]+)\s*(per\s*(year|annum|month)|\/(year|annum|month)|\b(yearly|monthly)\b)?/i;
   const m = text.match(re);
-  if (!m) return undefined;
+  if (!m) return {};
   const pounds = Number(m[1].replace(/,/g, ""));
-  if (isNaN(pounds)) return undefined;
-  return Math.round(pounds * 100);
+  if (isNaN(pounds)) return {};
+
+  const unit = (m[3] || m[4] || m[5] || "").toLowerCase();
+  let frequency: "monthly" | "yearly" | undefined;
+  if (/(month|monthly)/.test(unit)) frequency = "monthly";
+  else if (/(year|annum|yearly)/.test(unit)) frequency = "yearly";
+
+  return { pence: Math.round(pounds * 100), frequency };
 }
 
 export function detectAutoRenew(text: string): boolean {
@@ -89,7 +120,7 @@ export function extractPolicy(fromHeader: string | undefined, text: string): Ext
   const type = detectPolicyType(text);
   const policyNumber = extractPolicyNumber(text);
   const dates = extractDates(text);
-  const premiumPence = extractPremium(text) ?? null;
+  const { pence, frequency } = extractPremiumAndFrequency(text);
   const autoRenew = detectAutoRenew(text);
 
   return {
@@ -98,7 +129,8 @@ export function extractPolicy(fromHeader: string | undefined, text: string): Ext
     policyNumber,
     startDate: dates.start || null,
     endDate: dates.end || null,
-    premiumPence,
+    premiumPence: pence ?? null,
+    paymentFrequency: frequency ?? null,
     autoRenew,
   };
 }
