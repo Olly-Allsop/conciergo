@@ -6,7 +6,6 @@ import { getSession } from "@/lib/auth";
 import { extractPolicy } from "@/lib/extraction";
 import fs from "fs";
 import path from "path";
-import pdfParse from "pdf-parse";
 
 // Local copy of the shape we actually use so we don't depend on deep googleapis types
 interface MessagePart {
@@ -117,6 +116,7 @@ export async function POST() {
               // If PDF, extract text
               if (part.filename.toLowerCase().endsWith(".pdf")) {
                 try {
+                  const { default: pdfParse } = await import("pdf-parse");
                   const parsed = await pdfParse(dataBuf);
                   if (parsed.text) text += "\n" + parsed.text;
                 } catch {
